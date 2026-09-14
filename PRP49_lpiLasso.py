@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import Dataset, DataLoader, random_split
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from transformers import AutoTokenizer, AutoModel
 import pandas as pd
 from PRP49_ban import BANLayer
@@ -20,8 +20,8 @@ class BindingEnergyPredictor(nn.Module):
                  k=3,                 # 低秩分解参数
                  dropout=0.3,
                  ban_dropout=0.3,
-                 freeze_esm=False,    # ESM微调
-                 lassoesm_unfreeze=0, # LassoESM部分层微调，-1全部解冻
+                 freeze_esm=False,    # ESM 冻结
+                 lassoesm_unfreeze=0, # LassoESM 解冻，传入 -1 解冻全部参数
                  output_dim=1):
         super().__init__()
 
@@ -84,7 +84,6 @@ class BindingEnergyPredictor(nn.Module):
         return padded
 
     def forward(self, seq1_ids, seq1_mask, seq2_ids, seq2_mask):
-
         out1 = self.esm(input_ids=seq1_ids, attention_mask=seq1_mask)
         out2 = self.lassoesm(input_ids=seq2_ids, attention_mask=seq2_mask)
 
@@ -165,11 +164,37 @@ def main():
     max_len = 1024
     train_ratio = 0.8
     patience = 150
-    scheduler_patience = 3
-    factor = 0.5
     min_lr = 0.5e-6
-    dropout = 0.4
-    ban_dropout = 0.3
+    dropout = 0.5
+    ban_dropout = 0.4
+    T_0 = 20
+    T_mult = 2
+
+    # ========== 模型、优化算法、损失函数、学习率调度器 ==========
+    model = BindingEnergyPredictor(
+        esm_model_name=esm_model_name,
+        lassoesm_model_name=lassoesm_path,
+        h_dim=256,
+        n_heads=3,
+        k=2,
+        dropout=dropout,
+        ban_dropout=ban_dropout,
+        freeze_esm=False,
+        lassoesm_unfreeze=1
+    )
+    model.to(device)
+    model.train()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    loss_fn = nn.MSELoss()
+
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=T_0,
+        T_mult=T_mult,
+        eta_min=min_lr,
+    )
 
     # ========== 加载 tokenizer 和数据集 ==========
     tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
@@ -193,30 +218,6 @@ def main():
         collate_fn=lambda batch: collate_fn(batch, tokenizer, max_len)
     )
 
-    # ========== 模型、优化器、损失函数 ==========
-    model = BindingEnergyPredictor(
-        esm_model_name=esm_model_name,
-        lassoesm_model_name=lassoesm_path,
-        h_dim=256, n_heads=3, k=2,
-        dropout=dropout,
-        ban_dropout=ban_dropout,
-        freeze_esm=False,
-        lassoesm_unfreeze=1
-    )
-    model.to(device)
-    model.train()
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
-
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode='max',
-        factor=factor,
-        patience=scheduler_patience,
-        min_lr=min_lr,
-        verbose=True
-    )
 
     # ========== 早停机制 ==========
 #    best_val_loss = float('inf')
@@ -276,10 +277,12 @@ def main():
         ss_tot = float(ss_tot)
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-        print(f"Epoch {epoch + 1:3d} | Train Loss: {avg_train_loss:.6f} | "
-              f"Val Loss: {avg_val_loss:.6f} | RMSE: {rmse:.4f} | MAE: {mae:.4f} | R2: {r2:.4f}")
+        scheduler.step()
 
-        scheduler.step(r2)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"Epoch {epoch + 1:3d} | Train Loss: {avg_train_loss:.6f} | "
+              f"Val Loss: {avg_val_loss:.6f} | RMSE: {rmse:.4f} | MAE: {mae:.4f} | R2: {r2:.4f} | LR: {current_lr:.2e}")
 
 #        if avg_val_loss < best_val_loss:
 #            best_val_loss = avg_val_loss
@@ -292,7 +295,7 @@ def main():
 #                print(f"早停触发！验证 loss 连续 {patience} 轮未改善，训练在第 {epoch+1} 轮停止。")
 #                break
 
-        if r2 > 0.8*best_r2 and r2 > 0:
+        if r2 > best_r2 - 0.05:
             if r2 > best_r2:
                 best_r2 = r2
                 best_epoch = epoch + 1
