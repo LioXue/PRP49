@@ -7,8 +7,9 @@ from transformers import AutoTokenizer, AutoModel
 import pandas as pd
 from PRP49_ban import BANLayer
 from torch.nn.utils.parametrizations import weight_norm
-import copy
 import numpy as np
+import heapq
+from itertools import count
 
 # -------------------- 模型定义 --------------------
 class BindingEnergyPredictor(nn.Module):
@@ -106,9 +107,8 @@ class BindingEnergyPredictor(nn.Module):
 
 # -------------------- 数据集 --------------------
 class BindingEnergyDataset(Dataset):
-    def __init__(self, csv_path, max_len=512):
+    def __init__(self, csv_path):
         self.df = pd.read_csv(csv_path)
-        self.max_len = max_len
 
     def __len__(self):
         return len(self.df)
@@ -126,15 +126,15 @@ class BindingEnergyDataset(Dataset):
 
 
 # -------------------- 批处理函数 --------------------
-def collate_fn(batch, tokenizer, max_len):
+def collate_fn(batch, tokenizer, max_pro_len, max_lasso_len):
     protein_seqs = [item['protein_seq'] for item in batch]
     lasso_seqs = [item['lasso_seq'] for item in batch]
     energies = torch.stack([item['energy'] for item in batch], dim=0)
 
     tok1 = tokenizer(protein_seqs, return_tensors='pt',
-                     max_length=max_len, truncation=True, padding=True)
+                     max_length=max_pro_len, truncation=True, padding=True)
     tok2 = tokenizer(lasso_seqs, return_tensors='pt',
-                     max_length=max_len, truncation=True, padding=True)
+                     max_length=max_lasso_len, truncation=True, padding=True)
 
     return {
         'seq1_ids': tok1['input_ids'],
@@ -154,21 +154,23 @@ def set_seed(seed=42):
 # -------------------- 训练主程序 --------------------
 def main():
     set_seed(42)
-    csv_path = r"C:\autodockvina\prp49\outdata\out.csv"
+    csv_path = r"data/out_train.csv"
     esm_model_name = "facebook/esm2_t6_8M_UR50D"
     lassoesm_path = "./LassoESM"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 32
     epochs = 500
     lr = 8e-5
-    max_len = 1024
+    max_pro_len = 512
+    max_lasso_len = 128
     train_ratio = 0.8
-    patience = 150
+    patience = 100
     min_lr = 0.5e-6
-    dropout = 0.5
-    ban_dropout = 0.4
+    dropout = 0.4
+    ban_dropout = 0.3
     T_0 = 20
     T_mult = 2
+    top_n = 3
 
     # ========== 模型、优化算法、损失函数、学习率调度器 ==========
     model = BindingEnergyPredictor(
@@ -198,7 +200,7 @@ def main():
 
     # ========== 加载 tokenizer 和数据集 ==========
     tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
-    full_dataset = BindingEnergyDataset(csv_path, max_len=max_len)
+    full_dataset = BindingEnergyDataset(csv_path)
 
     train_size = int(train_ratio * len(full_dataset))
     print("训练集大小：", train_size)
@@ -211,20 +213,27 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_len)
+        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_pro_len, max_lasso_len)
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_len)
+        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_pro_len, max_lasso_len)
     )
 
 
     # ========== 早停机制 ==========
-#    best_val_loss = float('inf')
     best_r2 = -float('inf')
-    best_epoch = 0
+    best_loss = float('inf')
+    best_loss_epoch = 0
     early_stop_counter = 0
-    best_model_state = None
+    best_loss_model_state = None
+
+    # ========== 维护顶堆 ==========
+    r2_top_heap = []
+    tie_counter = count()
+    def cpu_state_dict(model):
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
 
     # ========== 训练循环 ==========
     print("start training")
@@ -295,17 +304,34 @@ def main():
 #                print(f"早停触发！验证 loss 连续 {patience} 轮未改善，训练在第 {epoch+1} 轮停止。")
 #                break
 
+        need_loss_snap = avg_train_loss * avg_val_loss < best_loss
+        need_r2_snap = (r2 > best_r2 - 0.05) and (len(r2_top_heap) < top_n or r2 > r2_top_heap[0][0])
+
+        snapshot = None
+        if need_loss_snap or need_r2_snap:
+            snapshot = cpu_state_dict(model)
+
+        if avg_train_loss * avg_val_loss < best_loss and snapshot is not None:
+            best_loss = avg_train_loss * avg_val_loss
+            best_loss_model_state = snapshot
+            best_loss_epoch = epoch + 1
+
         if r2 > best_r2 - 0.05:
+            if len(r2_top_heap) < top_n or r2 > r2_top_heap[0][0]:
+                entry = (r2, next(tie_counter), epoch + 1, snapshot)
+                if len(r2_top_heap) < top_n:
+                    heapq.heappush(r2_top_heap, entry)
+                else:
+                    heapq.heapreplace(r2_top_heap, entry)
             if r2 > best_r2:
                 best_r2 = r2
-                best_epoch = epoch + 1
-                best_model_state = copy.deepcopy(model.state_dict())
             early_stop_counter = 0
         else:
             early_stop_counter += 1
             if early_stop_counter >= patience:
                 print("早停触发！")
                 break
+
 
     #            best_epoch = epoch + 1
     #           early_stop_counter = 0
@@ -316,13 +342,17 @@ def main():
     #                print(f"早停触发！验证 loss 连续 {patience} 轮未改善，训练在第 {epoch+1} 轮停止。")
     #                break
 
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"已加载最佳模型（Epoch {best_epoch}，Best R2: {best_r2:.6f}）")
-        torch.save(best_model_state, "lpiLasso.pth")
-    else:
-        torch.save(model.state_dict(), "lpiLasso.pth")
+    r2_top_sorted = sorted(r2_top_heap, key=lambda x: x[0], reverse=True)
+    for rank, (r2_val, _, ep, state) in enumerate(r2_top_sorted, 1):
+        path = f"lpiLasso{rank}.pth"
+        torch.save(state, path)
+        print(f"加载R2模型lpiLasso{rank},pth, epoch{ep}, r2{r2_val:.4f}")
 
+    if best_loss_model_state is not None:
+        torch.save(best_loss_model_state, "lpiLassoLoss.pth")
+        print(f"加载最佳Loss模型, Epoch{best_loss_epoch}, Best Loss{best_loss:.6f}")
+    else:
+        torch.save(model.state_dict(), f"lpiLassoLoss.pth")
     print("training finished")
 
 if __name__ == "__main__":
